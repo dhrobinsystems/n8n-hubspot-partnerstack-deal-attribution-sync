@@ -1,0 +1,1841 @@
+{
+  "name": "n8n-hubspot-partnerstack-deal-attribution-sync",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "partnerstack-attribution",
+        "responseMode": "onReceived",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "ad26d8a1-a007-5765-87fc-90771fd9b2d9",
+      "name": "PartnerStack Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "00000000-0000-4000-8000-0000000000c8",
+      "notes": "PartnerStack partnership, deal, customer and transaction events (direct with ?key=…, or via a signing relay). 12 pinned fictional events."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Verify Signature & Normalize Event    Mode: Run Once for All Items\n// Repo: n8n-hubspot-partnerstack-deal-attribution-sync · dhRobin Systems\n// Authentication (fails closed, PARTNERSTACK_AUTH_MODES):\n//   hmac_sha256  X-Attribution-Signature: sha256=HMAC(secret, \"<ts>.<raw body>\")\n//                with X-Attribution-Timestamp inside the replay window. Used when\n//                a relay (or gateway) signs PartnerStack deliveries.\n//   url_token    PartnerStack's webhook API takes only a target URL and events,\n//                so direct deliveries are authenticated by a secret query\n//                parameter (?key=...) compared in constant time.\n// Normalisation: event name (dot or underscore form, or inferred), envelope,\n// partner key, program type and tier from the partner group, amounts,\n// timestamps, customer domain, and an idempotency key.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst helpers = this.helpers;\nlet crypto = null;\ntry { crypto = require('crypto'); } catch (error) { crypto = null; }\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst PERSIST = !SANDBOX_MODE && !DRY_RUN;\nconst AUTH_MODES = new Set(csv('PARTNERSTACK_AUTH_MODES', 'hmac_sha256,url_token').map((m) => m.toLowerCase()));\nconst SIG_HEADER = env('ATTRIBUTION_SIGNATURE_HEADER', 'x-attribution-signature').toLowerCase();\nconst TS_HEADER = env('ATTRIBUTION_TIMESTAMP_HEADER', 'x-attribution-timestamp').toLowerCase();\nconst TOKEN_PARAM = env('PARTNERSTACK_URL_TOKEN_PARAM', 'key');\nconst TOLERANCE = Math.max(30, num('SIGNATURE_TOLERANCE_SECONDS', 300));\nconst SANDBOX_SECRET = 'sandbox-fictional-partnerstack-secret-not-for-production';\nconst SECRET = env('PARTNERSTACK_WEBHOOK_SECRET', '') || (SANDBOX_MODE ? SANDBOX_SECRET : '');\nconst EVENT_TYPES = new Set(csv('PROCESS_EVENT_TYPES', 'deal.created,deal.updated,deal.stage_updated,customer.created,customer.updated,transaction.created,partnership.created,partnership.updated'));\nconst LEDGER_DAYS = Math.max(1, num('EVENT_LEDGER_DAYS', 45));\nconst CENTS = flag('TRANSACTION_AMOUNT_IN_CENTS', true);\nconst DOMAIN_META = csv('DEAL_DOMAIN_META_KEYS', 'company_domain,domain,website,company_website').map((k) => k.toLowerCase());\nconst EMAIL_META = csv('DEAL_EMAIL_META_KEYS', 'contact_email,email,customer_email').map((k) => k.toLowerCase());\nconst FREE = new Set(['gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com', 'yahoo.com', 'icloud.com', 'me.com', 'aol.com', 'proton.me', 'protonmail.com', 'gmx.com']);\n\nlet runId;\ntry { runId = 'ps_' + crypto.randomUUID(); } catch (error) { runId = 'ps_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }\nconst run = { runId, startedAt: new Date().toISOString(), mode: SANDBOX_MODE ? 'sandbox' : DRY_RUN ? 'dry_run' : 'live', sandboxMode: SANDBOX_MODE, dryRun: DRY_RUN };\nconst items = $input.all();\nconst sharedFixtures = SANDBOX_MODE ? ((items.find((i) => i.json.sandboxFixtures) || { json: {} }).json.sandboxFixtures || null) : null;\n\nconst sha = (s) => crypto.createHash('sha256').update(String(s)).digest();\nconst safeEqual = (a, b) => !!crypto && typeof a === 'string' && typeof b === 'string' && a.length > 0 && b.length > 0 && crypto.timingSafeEqual(sha(a), sha(b));\n\nfunction authenticate(headers, query, raw) {\n  if (!crypto) return { ok: false, reason: 'crypto_module_unavailable' };\n  if (!SECRET) return { ok: false, reason: 'webhook_secret_not_configured' };\n  if (headers[SIG_HEADER] !== undefined) {\n    if (!AUTH_MODES.has('hmac_sha256')) return { ok: false, method: 'hmac_sha256', reason: 'hmac_mode_disabled' };\n    const provided = String(headers[SIG_HEADER]).replace(/^sha256=/i, '').trim();\n    const ts = String(headers[TS_HEADER] || '').trim();\n    if (!/^\\d{10,13}$/.test(ts)) return { ok: false, method: 'hmac_sha256', reason: 'timestamp_header_missing' };\n    const digest = crypto.createHmac('sha256', SECRET).update(`${ts}.${raw}`, 'utf8').digest();\n    if (!(safeEqual(provided.toLowerCase(), digest.toString('hex')) || safeEqual(provided, digest.toString('base64')))) return { ok: false, method: 'hmac_sha256', reason: 'signature_mismatch' };\n    const tsSec = ts.length > 10 ? Math.floor(Number(ts) / 1000) : Number(ts);\n    if (!SANDBOX_MODE && Math.abs(Date.now() / 1000 - tsSec) > TOLERANCE) return { ok: false, method: 'hmac_sha256', reason: 'timestamp_outside_tolerance' };\n    return { ok: true, method: 'hmac_sha256' };\n  }\n  if (!AUTH_MODES.has('url_token')) return { ok: false, method: 'hmac_sha256', reason: 'signature_header_missing' };\n  const provided = query[TOKEN_PARAM] !== undefined ? String(query[TOKEN_PARAM]) : '';\n  if (!provided) return { ok: false, method: 'url_token', reason: 'url_token_missing' };\n  return safeEqual(provided, SECRET) ? { ok: true, method: 'url_token' } : { ok: false, method: 'url_token', reason: 'url_token_mismatch' };\n}\n\nconst toIso = (v) => { if (v === null || v === undefined || v === '') return null; const n = Number(v); const d = Number.isFinite(n) ? new Date(n < 1e12 ? n * 1000 : n) : new Date(String(v)); return Number.isNaN(d.getTime()) ? null : d.toISOString(); };\nconst toMs = (v) => { const iso = toIso(v); return iso ? Date.parse(iso) : null; };\nconst money = (v, cents) => { const n = Number(v); return Number.isFinite(n) ? Math.round((cents ? n / 100 : n) * 100) / 100 : null; };\nconst domainOf = (v) => {\n  if (!v) return null;\n  let s = String(v).trim().toLowerCase();\n  if (s.includes('@')) s = s.split('@').pop();\n  s = s.replace(/^[a-z]+:\\/\\//, '').replace(/^www\\./, '').split(/[/?#:]/)[0];\n  return /^[a-z0-9-]+(\\.[a-z0-9-]+)+$/.test(s) && !FREE.has(s) ? s : null;\n};\nconst email = (v) => { const s = String(v || '').trim().toLowerCase(); return /^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(s) ? s : null; };\nconst metaValue = (meta, prefixes) => {\n  if (!meta || typeof meta !== 'object') return null;\n  // PartnerStack custom-field keys carry a random suffix (company_name_38n83e3e3), so match by prefix.\n  for (const [k, v] of Object.entries(meta)) { const key = k.toLowerCase(); if (v && prefixes.some((p) => key === p || key.startsWith(`${p}_`))) return String(v); }\n  return null;\n};\nconst programFromGroup = (g) => {\n  if (!g) return null;\n  const text = `${g.slug || ''} ${g.name || ''}`.toLowerCase();\n  const programType = /resell|var\\b|distribut/.test(text) ? 'reseller' : /affiliat|influenc|creator/.test(text) ? 'affiliate' : 'referral';\n  const m = text.match(/platinum|gold|silver|bronze|tier[-_ ]?(\\d)/);\n  return { programType, tier: m ? (m[1] ? `tier_${m[1]}` : m[0]) : null, groupSlug: g.slug ? String(g.slug).slice(0, 80) : null, groupName: g.name ? String(g.name).slice(0, 120) : null };\n};\nfunction inferType(d) {\n  if (d.stage !== undefined && d.partner_key !== undefined) return 'deal';\n  if (d.customer_key !== undefined && d.amount !== undefined) return 'transaction';\n  if (d.group !== undefined && d.partner_key !== undefined) return 'partnership';\n  if (d.email !== undefined && d.partner_key !== undefined && d.key !== undefined) return 'customer';\n  return null;\n}\n\nconst staticData = $getWorkflowStaticData('global');\nconst ledger = PERSIST ? (staticData.psAttributionLedger = staticData.psAttributionLedger || {}) : JSON.parse(JSON.stringify(staticData.psAttributionLedger || {}));\nconst nowMs = Date.now();\nfor (const [k, v] of Object.entries(ledger)) if (!v || nowMs - v.at > LEDGER_DAYS * 86400000) delete ledger[k];\nconst seen = new Set();\n\nconst out = [];\nfor (let index = 0; index < items.length; index++) {\n  const item = items[index];\n  const headers = {};\n  for (const [k, v] of Object.entries(item.json.headers || {})) headers[String(k).toLowerCase()] = Array.isArray(v) ? String(v[0]) : String(v);\n  const query = item.json.query || {};\n  let raw = null;\n  if (item.binary && item.binary.data) { try { raw = (await helpers.getBinaryDataBuffer(index, 'data')).toString('utf8'); } catch (e) { raw = null; } }\n  let body = item.json.body;\n  if ((!body || (typeof body === 'object' && !Object.keys(body).length)) && raw) { try { body = JSON.parse(raw); } catch (e) { body = null; } }\n  if (raw === null) raw = typeof body === 'string' ? body : JSON.stringify(body ?? {});\n  if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = null; } }\n  const base = { run, sandboxFixtures: sharedFixtures, deliveryRef: `delivery-${index + 1}` };\n\n  const auth = authenticate(headers, query, raw);\n  if (!auth.ok) { out.push({ json: { ...base, kind: 'rejected', reason: auth.reason, authMethod: auth.method || null } }); continue; }\n  const b = body && typeof body === 'object' ? body : {};\n  const d = b.data && typeof b.data === 'object' && !Array.isArray(b.data) && (b.event || b.type) ? b.data : b;\n  let eventName = String(b.event || b.type || query.event || headers['x-partnerstack-event'] || '').trim().toLowerCase();\n  if (eventName) eventName = eventName.replace(/^(deal|customer|transaction|partnership|lead|reward|action|message)_/, '$1.').replace('deal.stage_update', 'deal.stage_updated').replace('deal.stage_updated', 'deal.stage_updated');\n  const objectType = eventName ? eventName.split('.')[0] : inferType(d);\n  if (!eventName && objectType) eventName = `${objectType}.updated`;\n  const ignore = (reason) => out.push({ json: { ...base, kind: 'ignored', reason, authMethod: auth.method, event: { name: eventName || null, objectKey: d.key ? String(d.key).slice(0, 80) : null } } });\n  if (!eventName || !objectType) { ignore('event_type_unknown'); continue; }\n  if (!EVENT_TYPES.has(eventName)) { ignore('event_type_not_processed'); continue; }\n  if (d.archived === true || d.archived === 'true') { if (objectType !== 'partnership') { ignore('archived_record'); continue; } }\n\n  const objectKey = d.key ? String(d.key).slice(0, 80) : objectType === 'partnership' && d.partner_key ? `partner:${d.partner_key}` : null;\n  if (!objectKey) { ignore('missing_object_key'); continue; }\n  const updatedMs = toMs(d.updated_at) || toMs(d.created_at) || nowMs;\n  const dedupeKey = `${eventName}:${objectKey}:${updatedMs}`;\n  if (seen.has(dedupeKey) || ledger[dedupeKey]) { ignore('duplicate_event'); continue; }\n  seen.add(dedupeKey);\n\n  const ev = { name: eventName, objectType, action: eventName.split('.').slice(1).join('.'), objectKey, partnerKey: d.partner_key ? String(d.partner_key).slice(0, 80) : null, occurredAt: new Date(updatedMs).toISOString(), occurredMs: updatedMs, createdAt: toIso(d.created_at) };\n  let record = {};\n  if (objectType === 'deal') {\n    const contactEmail = email(metaValue(d.meta, EMAIL_META));\n    record = { accountName: d.account_name ? String(d.account_name).slice(0, 160) : null, amount: money(d.amount, false), closeDate: toIso(d.close_date), stage: d.stage ? String(d.stage).slice(0, 60) : null,\n      customerDomain: domainOf(metaValue(d.meta, DOMAIN_META)) || domainOf(contactEmail), customerEmail: contactEmail, psCompanyId: d.company_id != null ? String(d.company_id) : null };\n  } else if (objectType === 'customer') {\n    const e = email(d.email);\n    record = { customerKey: objectKey, customerEmail: e, customerDomain: domainOf(e), customerName: d.name ? String(d.name).slice(0, 160) : null };\n  } else if (objectType === 'transaction') {\n    record = { transactionKey: objectKey, customerKey: d.customer_key ? String(d.customer_key).slice(0, 80) : null, amount: money(d.amount, CENTS), currency: d.currency ? String(d.currency).toUpperCase().slice(0, 3) : null };\n  } else if (objectType === 'partnership') {\n    const e = email(d.email);\n    record = { partnerEmailDomain: domainOf(e), partnerEmail: e, archived: d.archived === true || d.archived === 'true', program: programFromGroup(d.group) };\n  }\n  if (!ev.partnerKey && objectType !== 'transaction') { ignore('no_partner_key'); continue; }\n  out.push({ json: { ...base, kind: 'event', authMethod: auth.method, dedupeKey, event: ev, record } });\n}\nreturn out;\n"
+      },
+      "id": "0510e712-fc67-54e3-ac19-e6a48e91c30a",
+      "name": "Verify Signature & Normalize Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "notes": "HMAC (relay) or URL token (direct) · event name normalisation · partner key, program and tier · amounts · idempotency key."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "339bac2a-0af6-5edf-947d-b76fe6503b37",
+              "leftValue": "={{ $json.kind }}",
+              "rightValue": "event",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "7047cb7a-3758-5a9b-b8bb-5bdbb47be4d5",
+      "name": "Process Event?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Lookup Plan                     Mode: Run Once for Each Item\n// HubSpot searches for the partner company, the customer company and the\n// customer contact. Searches that don't apply get a no-result filter, so\n// the live chain stays linear for every event type.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst P = env('PS_PROPERTY_PREFIX', 'ps_');\nconst item = $json; const ev = item.event; const r = item.record;\nconst noop = { filterGroups: [{ filters: [{ propertyName: 'hs_object_id', operator: 'EQ', value: '0' }] }], limit: 1 };\nconst eq = (p, v) => ({ filters: [{ propertyName: p, operator: 'EQ', value: v }] });\nconst partnerProps = ['name', 'domain', `${P}partner_key`, `${P}partner_tier`, `${P}program_type`, `${P}commission_rate`, `${P}partner_status`];\nconst companyProps = ['name', 'domain', 'hubspot_owner_id', `${P}partner_key`, `${P}customer_key`, `${P}attribution_status`, `${P}referred_at`, `${P}last_transaction_key`, `${P}partner_sourced_revenue`];\nconst groupsPartner = [];\nif (ev.partnerKey) groupsPartner.push(eq(`${P}partner_key`, ev.partnerKey));\nif (ev.objectType === 'partnership' && r.partnerEmailDomain) groupsPartner.push(eq('domain', r.partnerEmailDomain), eq('domain', `www.${r.partnerEmailDomain}`));\nlet company = noop; let contact = noop;\nif ((ev.objectType === 'deal' || ev.objectType === 'customer') && r.customerDomain) company = { filterGroups: [eq('domain', r.customerDomain), eq('domain', `www.${r.customerDomain}`)], properties: companyProps, limit: 10 };\nif (ev.objectType === 'transaction' && r.customerKey) { company = { filterGroups: [eq(`${P}customer_key`, r.customerKey)], properties: companyProps, limit: 5 }; contact = { filterGroups: [eq(`${P}customer_key`, r.customerKey)], properties: ['email', 'associatedcompanyid', `${P}partner_key`, `${P}customer_key`], limit: 5 }; }\nif ((ev.objectType === 'customer' || ev.objectType === 'deal') && r.customerEmail) contact = { filterGroups: [eq('email', r.customerEmail)], properties: ['email', 'associatedcompanyid', `${P}partner_key`, `${P}customer_key`], limit: 5 };\nreturn { json: { ...item, lookup: { prefix: P, partnerCompany: groupsPartner.length ? { filterGroups: groupsPartner.slice(0, 5), properties: partnerProps, limit: 10 } : noop, company, contact, noop } } };\n"
+      },
+      "id": "eef61729-cbb9-5b18-bace-b3a81137f0fb",
+      "name": "Build Lookup Plan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "5d2330a4-4642-5cb6-ba97-71bfac1e37cd",
+              "leftValue": "={{ $json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "2da7c49e-9c19-5cb6-9da3-bcffd74ad5f6",
+      "name": "Sandbox Lookups?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        960,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate HubSpot Lookups (Sandbox)    Mode: Run Once for Each Item\n// Answers every live search from fictional fixtures, in the CRM search\n// (and PartnerStack partnership) response shapes.\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json; const fx = item.sandboxFixtures || {}; const P = item.lookup.prefix;\nconst ev = item.event; const r = item.record;\nconst ok = (list) => ({ statusCode: 200, body: { total: list.length, results: list.map((x) => ({ id: x.id, properties: x.properties })) } });\nconst norm = (v) => String(v || '').toLowerCase().replace(/^www\\./, '');\nconst companies = fx.companies || [];\nconst partner = companies.filter((c) => (ev.partnerKey && c.properties[`${P}partner_key`] === ev.partnerKey) || (ev.objectType === 'partnership' && r.partnerEmailDomain && norm(c.properties.domain) === r.partnerEmailDomain));\nlet customer = [];\nif ((ev.objectType === 'deal' || ev.objectType === 'customer') && r.customerDomain) customer = companies.filter((c) => norm(c.properties.domain) === r.customerDomain);\nif (ev.objectType === 'transaction' && r.customerKey) customer = companies.filter((c) => c.properties[`${P}customer_key`] === r.customerKey);\nconst contacts = (fx.contacts || []).filter((c) => (r.customerEmail && c.properties.email === r.customerEmail) || (ev.objectType === 'transaction' && r.customerKey && c.properties[`${P}customer_key`] === r.customerKey));\nconst cid = customer[0] ? customer[0].id : null;\nconst deals = ev.objectType === 'partnership' ? [] : (fx.deals || []).filter((d) => (ev.objectType === 'deal' && d.properties[`${P}deal_key`] === ev.objectKey) || (cid && d.companyId === cid));\nconst ps = (fx.partnerships || {})[ev.partnerKey];\nreturn { json: { ...item, simulatedLookup: { partnerCompany: ok(partner), company: ok(customer), contact: ok(contacts), deals: ok(deals),\n  partnership: ps ? { statusCode: 200, body: { data: ps } } : null } } };\n"
+      },
+      "id": "2bea132c-2728-51e4-8e6d-86c67cb094c5",
+      "name": "Simulate HubSpot Lookups (Sandbox)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v3/objects/companies/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.lookup.partnerCompany) }}"
+      },
+      "id": "afda3501-0c7e-57cb-8aa7-229c050ca706",
+      "name": "Search Partner Company",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        340
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "ps_partner_key, or the partner's e-mail domain on partnership events."
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v3/objects/companies/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Build Lookup Plan').item.json.lookup.company) }}"
+      },
+      "id": "1a221fbf-d043-5046-ac5c-15e9acd39943",
+      "name": "Search Customer Company",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1440,
+        340
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Customer domain (deal meta / customer e-mail) or ps_customer_key (transactions)."
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v3/objects/contacts/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Build Lookup Plan').item.json.lookup.contact) }}"
+      },
+      "id": "4e8352ba-aa46-5838-a25c-4b1235187096",
+      "name": "Search Customer Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1680,
+        340
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Pick Records & Build Deal Search      Mode: Run Once for Each Item\n// Chooses the partner company, customer company and contact, then builds\n// the deal search: by PartnerStack deal key, or deals on the customer company.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst placeholder = (v) => !v || /^YOUR_/i.test(String(v));\nconst ENRICH = flag('PARTNERSTACK_ENRICH_PARTNER', true) && !placeholder(env('PARTNERSTACK_API_KEY', '')) && !placeholder(env('PARTNERSTACK_PUBLIC_KEY', ''));\nconst sandbox = !!($json && $json.simulatedLookup);\nlet ctx; let res;\nif (sandbox) { ctx = $json; res = ctx.simulatedLookup; }\nelse {\n  ctx = $('Build Lookup Plan').item.json;\n  res = { partnerCompany: $('Search Partner Company').item.json, company: $('Search Customer Company').item.json, contact: $json };\n}\nconst P = ctx.lookup.prefix; const ev = ctx.event; const r = ctx.record;\nconst errors = [];\nconst list = (name, x, used) => { if (!used) return []; if (Number(x && x.statusCode) !== 200 || !x.body || !Array.isArray(x.body.results)) { errors.push(`${name} search ${(x && x.statusCode) || 'network error'}`); return []; } return x.body.results; };\nconst isNoop = (b) => JSON.stringify(b) === JSON.stringify(ctx.lookup.noop);\nconst norm = (v) => String(v || '').toLowerCase().replace(/^[a-z]+:\\/\\//, '').replace(/^www\\./, '').split('/')[0];\nconst slim = (x) => (x ? { id: String(x.id), properties: x.properties || {} } : null);\n\nconst partners = list('partner company', res.partnerCompany, !isNoop(ctx.lookup.partnerCompany));\nconst partnerCompany = slim(partners.find((c) => (c.properties || {})[`${P}partner_key`] === ev.partnerKey) || partners.find((c) => r.partnerEmailDomain && norm(c.properties.domain) === r.partnerEmailDomain));\nconst companies = list('customer company', res.company, !isNoop(ctx.lookup.company));\nconst exact = companies.filter((c) => (r.customerDomain && norm(c.properties.domain) === r.customerDomain) || (r.customerKey && c.properties[`${P}customer_key`] === r.customerKey));\nconst contacts = list('contact', res.contact, !isNoop(ctx.lookup.contact));\nconst contact = slim(contacts[0]);\nlet customerCompany = slim(exact[0]);\nlet companySource = customerCompany ? (r.customerKey && ev.objectType === 'transaction' ? 'customer_key' : 'domain') : null;\nif (!customerCompany && contact && contact.properties.associatedcompanyid) { customerCompany = { id: String(contact.properties.associatedcompanyid), properties: {} }; companySource = 'contact_primary_company'; }\n\nconst dealGroups = [];\nif (ev.objectType === 'deal') dealGroups.push({ filters: [{ propertyName: `${P}deal_key`, operator: 'EQ', value: ev.objectKey }] });\nif (customerCompany && ev.objectType !== 'partnership' && ev.objectType !== 'customer') dealGroups.push({ filters: [{ propertyName: 'associations.company', operator: 'EQ', value: customerCompany.id }] });\nconst dealProps = ['dealname', 'dealstage', 'amount', 'closedate', 'hs_is_closed', 'hs_is_closed_won', 'hs_lastmodifieddate', 'hubspot_owner_id',\n  ...['deal_key', 'partner_key', 'attribution_status', 'commission_status', 'estimated_commission', 'partner_sourced_revenue', 'last_transaction_key', 'last_event_at', 'won_at'].map((p) => `${P}${p}`)];\nconst { simulatedLookup, ...rest } = ctx;\nreturn {\n  json: {\n    ...rest,\n    ...(sandbox ? { simulatedLookup } : {}),\n    picked: { partnerCompany, customerCompany, companySource, contact, customerCompanyCount: exact.length, errors },\n    enrichPartner: !sandbox && ENRICH && !!ev.partnerKey,\n    searches: { deals: dealGroups.length ? { filterGroups: dealGroups, properties: dealProps, sorts: [{ propertyName: 'hs_lastmodifieddate', direction: 'DESCENDING' }], limit: 20 } : ctx.lookup.noop },\n  },\n};\n"
+      },
+      "id": "b47574b3-46a4-5693-908d-43365aadde5f",
+      "name": "Pick Records & Build Deal Search",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ac039795-62a0-5afb-9891-4336bec952e7",
+              "leftValue": "={{ !$json.simulatedLookup }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f8b24638-49d8-5906-a0ba-06bda3f7fe27",
+      "name": "Live Deal Search?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2160,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v3/objects/deals/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.searches.deals) }}"
+      },
+      "id": "d9476854-a17e-5fba-a7ba-19246dcce8cc",
+      "name": "Search Candidate Deals",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2400,
+        340
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "ps_deal_key, or deals associated with the customer company."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "24f60cb0-3904-553b-8759-73e0913a3e47",
+              "leftValue": "={{ $('Pick Records & Build Deal Search').item.json.enrichPartner }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "4156d59d-62ef-5bda-a59f-e54584674226",
+      "name": "Enrich Partner?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2640,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ ($env.PARTNERSTACK_API_BASE_URL || 'https://api.partnerstack.com/api/v2') + '/partnerships/' + encodeURIComponent($('Pick Records & Build Deal Search').item.json.event.partnerKey) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Basic ' + (($env.PARTNERSTACK_PUBLIC_KEY || '') + ':' + ($env.PARTNERSTACK_API_KEY || '')).base64Encode() }}"
+            }
+          ]
+        }
+      },
+      "id": "c257edec-d84e-5f2b-9842-06b9933166d7",
+      "name": "Fetch PartnerStack Partnership",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2880,
+        440
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Optional · Vendor API Basic auth (public key : secret key) · partner group → program and tier."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Resolve Attribution                   Mode: Run Once for Each Item\n// Partner program: partnership event group → PartnerStack API group →\n// HubSpot partner company properties → DEFAULT_PROGRAM_TYPE.\n// Deal: exact PartnerStack deal key → the customer company's single open\n// deal (or best name/amount match) for registrations, its won deal for\n// transactions. Ties are never auto-resolved.\n// Guards: stale events, already-applied transactions, attribution\n// conflicts (first-touch by default) and suspected self-referrals.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst MODEL = env('ATTRIBUTION_MODEL', 'first_touch').toLowerCase() === 'last_touch' ? 'last_touch' : 'first_touch';\nconst DEFAULT_PROGRAM = env('DEFAULT_PROGRAM_TYPE', 'referral');\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst sandbox = !!($json && $json.simulatedLookup);\nconst ctx = sandbox ? $json : $('Pick Records & Build Deal Search').item.json;\nconst dealsRes = sandbox ? ctx.simulatedLookup.deals : $('Search Candidate Deals').item.json;\nlet psRes = sandbox ? ctx.simulatedLookup.partnership : null;\nif (!sandbox && ctx.enrichPartner) { try { psRes = $('Fetch PartnerStack Partnership').item.json; } catch (e) { psRes = null; } }\nconst P = ctx.lookup.prefix; const ev = ctx.event; const r = ctx.record; const pk = ctx.picked;\nconst errors = [...pk.errors];\nconst p = (rec, name) => (rec && rec.properties ? rec.properties[`${P}${name}`] : null) ?? null;\nconst isNoop = JSON.stringify(ctx.searches.deals) === JSON.stringify(ctx.lookup.noop);\nlet deals = [];\nif (!isNoop) { if (Number(dealsRes && dealsRes.statusCode) === 200 && dealsRes.body && Array.isArray(dealsRes.body.results)) deals = dealsRes.body.results.map((d) => ({ id: String(d.id), properties: d.properties || {} })); else errors.push(`deal search ${(dealsRes && dealsRes.statusCode) || 'network error'}`); }\n\n// ── Partner program ───────────────────────────────────────────────────\nlet RULES = {\n  reseller: { rewardType: 'margin_on_deal', rates: { platinum: 0.3, gold: 0.25, silver: 0.2, bronze: 0.15, default: 0.15 } },\n  referral: { rewardType: 'percent_of_first_deal', rates: { platinum: 0.25, gold: 0.2, silver: 0.15, bronze: 0.1, default: 0.1 } },\n  affiliate: { rewardType: 'recurring_percent', rates: { platinum: 0.35, gold: 0.3, silver: 0.25, bronze: 0.2, default: 0.2 } },\n};\ntry { const j = JSON.parse(env('PROGRAM_RULES_JSON', '')); if (j && typeof j === 'object') RULES = { ...RULES, ...j }; } catch (e) { /* defaults */ }\nlet GROUPS = {};\ntry { GROUPS = JSON.parse(env('PARTNER_GROUP_MAP_JSON', '')) || {}; } catch (e) { GROUPS = {}; }\nif (SANDBOX_MODE && !Object.keys(GROUPS).length && ctx.sandboxFixtures) GROUPS = ctx.sandboxFixtures.partnerGroupMap || {};\nconst fromGroup = (g) => {\n  if (!g) return null;\n  if (g.slug && GROUPS[g.slug]) return { ...GROUPS[g.slug], groupSlug: g.slug, groupName: g.name || null, source: 'group_map' };\n  const text = `${g.slug || ''} ${g.name || ''}`.toLowerCase();\n  const m = text.match(/platinum|gold|silver|bronze|tier[-_ ]?(\\d)/);\n  return { programType: /resell|var\\b|distribut/.test(text) ? 'reseller' : /affiliat|influenc|creator/.test(text) ? 'affiliate' : 'referral', tier: m ? (m[1] ? `tier_${m[1]}` : m[0]) : null, groupSlug: g.slug || null, groupName: g.name || null, source: 'group_name' };\n};\nlet program = null;\nif (r.program) { const gm = r.program.groupSlug ? GROUPS[r.program.groupSlug] : null; program = gm ? { ...r.program, ...gm, source: 'group_map' } : { ...r.program, source: 'partnership_event' }; }\nif (!program && psRes && Number(psRes.statusCode) === 200 && psRes.body) { const d = psRes.body.data || psRes.body; program = fromGroup(d.group); if (program) program.source = `partnerstack_api_${program.source}`; }\nif (!program && pk.partnerCompany && p(pk.partnerCompany, 'program_type')) program = { programType: p(pk.partnerCompany, 'program_type'), tier: p(pk.partnerCompany, 'partner_tier'), source: 'hubspot_partner_company' };\nif (!program) program = { programType: DEFAULT_PROGRAM, tier: null, source: 'default' };\nprogram.programType = RULES[program.programType] ? program.programType : DEFAULT_PROGRAM;\nconst rule = RULES[program.programType] || RULES.referral;\nlet rate = Number(p(pk.partnerCompany, 'commission_rate'));\nlet rateSource = 'hubspot_partner_company';\nif (!Number.isFinite(rate) || rate <= 0) { rate = Number(program.commissionRate); rateSource = 'group_map'; }\nif (!Number.isFinite(rate) || rate <= 0) { rate = (rule.rates || {})[program.tier] ?? (rule.rates || {}).default ?? 0; rateSource = 'program_rules'; }\nif (rate > 1) rate = rate / 100;\nprogram.rewardType = program.rewardType || rule.rewardType;\nprogram.commissionRate = Math.round(rate * 10000) / 10000;\nprogram.rateSource = rateSource;\nprogram.partnerName = pk.partnerCompany ? pk.partnerCompany.properties.name || null : null;\n\n// ── Deal match ────────────────────────────────────────────────────────\nlet deal = null; let dealMatch = 'not_applicable'; const candidates = [];\nif (ev.objectType === 'deal') {\n  const byKey = deals.find((d) => d.properties[`${P}deal_key`] === ev.objectKey);\n  if (byKey) { deal = byKey; dealMatch = 'deal_key'; }\n  else if (pk.customerCompany) {\n    const open = deals.filter((d) => String(d.properties.hs_is_closed) !== 'true' && !d.properties[`${P}deal_key`]);\n    if (open.length === 1) { deal = open[0]; dealMatch = 'company_open_deal'; }\n    else if (open.length > 1) {\n      const tokens = String(r.accountName || '').toLowerCase().split(/\\W+/).filter((t) => t.length > 3);\n      const scored = open.map((d) => { let s = 0; const name = String(d.properties.dealname || '').toLowerCase(); s += tokens.filter((t) => name.includes(t)).length;\n        const amt = Number(d.properties.amount); if (r.amount && Number.isFinite(amt) && amt > 0 && Math.abs(amt - r.amount) / r.amount <= 0.1) s += 2; return { d, s }; }).sort((a, b) => b.s - a.s);\n      for (const x of scored.slice(0, 4)) candidates.push({ id: x.d.id, name: x.d.properties.dealname || null, score: x.s });\n      if (scored[0].s > 0 && (!scored[1] || scored[0].s > scored[1].s)) { deal = scored[0].d; dealMatch = 'company_open_deal_scored'; } else dealMatch = 'ambiguous';\n    } else dealMatch = 'no_open_deal';\n  } else dealMatch = 'unmatched';\n} else if (ev.objectType === 'transaction' && pk.customerCompany) {\n  const won = deals.filter((d) => String(d.properties.hs_is_closed_won) === 'true');\n  deal = won.find((d) => d.properties[`${P}partner_key`] === ev.partnerKey) || won[0] || null;\n  dealMatch = deal ? 'company_won_deal' : 'no_won_deal';\n}\n\n// ── Guards ────────────────────────────────────────────────────────────\nconst flags = [];\nconst lastEvent = Date.parse(p(deal, 'last_event_at') || '');\nif (ev.objectType === 'deal' && deal && Number.isFinite(lastEvent) && lastEvent > ev.occurredMs) flags.push('stale_event');\nif (ev.objectType === 'transaction' && (p(deal, 'last_transaction_key') === r.transactionKey || p(pk.customerCompany, 'last_transaction_key') === r.transactionKey)) flags.push('transaction_already_applied');\nconst conflicts = [];\nfor (const [name, rec] of [['deal', deal], ['company', pk.customerCompany], ['contact', pk.contact]]) {\n  const existing = p(rec, 'partner_key');\n  if (rec && existing && ev.partnerKey && existing !== ev.partnerKey && ev.objectType !== 'partnership') conflicts.push({ record: name, id: rec.id, existingPartnerKey: existing });\n}\nif (conflicts.length) flags.push(MODEL === 'first_touch' ? 'attribution_conflict_kept_existing' : 'attribution_conflict_overwritten');\nconst partnerDomain = pk.partnerCompany ? String(pk.partnerCompany.properties.domain || '').toLowerCase().replace(/^www\\./, '') : null;\nif (partnerDomain && r.customerDomain && partnerDomain === r.customerDomain) flags.push('self_referral_suspected');\nif (pk.customerCompany && pk.partnerCompany && pk.customerCompany.id === pk.partnerCompany.id && !flags.includes('self_referral_suspected')) flags.push('self_referral_suspected');\nif (pk.customerCompanyCount > 1) flags.push('duplicate_customer_companies');\n\nconst { simulatedLookup, searches, lookup, ...rest } = ctx;\nreturn { json: { ...rest, prefix: P, attribution: { model: MODEL, program, deal, dealMatch, candidates, flags, conflicts, errors } } };\n"
+      },
+      "id": "b0dca29b-15ad-55fd-b49f-1432aeb030f0",
+      "name": "Resolve Attribution",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        200
+      ],
+      "notes": "Program & rate · deal by key / company · stale, duplicate-transaction, conflict and self-referral guards."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Commission & Association Router       Mode: Run Once for Each Item\n// Turns the resolved attribution into HubSpot writes:\n//   deal     partner fields, registration stage, attribution and commission\n//            status, estimated commission, partner-sourced revenue\n//   company  partner fields, attribution status, referral date, customer key\n//   contact  partner and customer keys (customer events)\n//   partner  tier, program, status (partnership events)\n//   link     deal ↔ partner company (USER_DEFINED label, if configured)\n// Commission rules (estimates only; PartnerStack stays the system of record):\n//   registered → pending · won → eligible (reseller/referral: amount × rate;\n//   affiliate: accruing) · lost → not_eligible (0) · transaction → revenue\n//   added; affiliate (recurring_percent) also accrues amount × rate.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst WON = csv('PS_WON_STAGES', 'Closed Won,Won,closed_won').map((s) => s.toLowerCase());\nconst LOST = csv('PS_LOST_STAGES', 'Closed Lost,Lost,closed_lost,Disqualified').map((s) => s.toLowerCase());\nconst CURRENCY = env('COMMISSION_CURRENCY', 'USD').toUpperCase();\nconst placeholder = (v) => !v || /^YOUR_/i.test(String(v));\nlet ASSOC_ID = env('HUBSPOT_PARTNER_ASSOCIATION_TYPE_ID', '');\nconst ASSOC_CAT = env('HUBSPOT_PARTNER_ASSOCIATION_CATEGORY', 'USER_DEFINED');\nconst item = $json; const P = item.prefix; const ev = item.event; const r = item.record; const a = item.attribution; const pk = item.picked;\nif (placeholder(ASSOC_ID) && SANDBOX_MODE && item.sandboxFixtures) ASSOC_ID = item.sandboxFixtures.partnerAssociationTypeId || '';\nconst round2 = (n) => Math.round(n * 100) / 100;\nconst nz = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };\nconst prog = a.program;\nconst keepExisting = a.flags.includes('attribution_conflict_kept_existing');\nconst selfRef = a.flags.includes('self_referral_suspected');\nconst holds = []; const writes = []; const notes = [];\nconst partnerFields = (rec) => {\n  const f = {};\n  if (keepExisting && a.conflicts.some((c) => rec && c.id === rec.id)) return f;\n  f[`${P}partner_key`] = ev.partnerKey;\n  if (prog.partnerName) f[`${P}partner_name`] = prog.partnerName;\n  f[`${P}program_type`] = prog.programType;\n  if (prog.tier) f[`${P}partner_tier`] = prog.tier;\n  const conflict = a.conflicts.find((c) => rec && c.id === rec.id);\n  if (conflict && a.model === 'last_touch') f[`${P}previous_partner_key`] = conflict.existingPartnerKey;\n  return f;\n};\nconst add = (object, rec, props, label) => { if (rec && Object.keys(props).length) writes.push({ kind: 'update', object, id: rec.id, label, properties: props }); };\n\nlet stageStatus = null; let commission = null;\nif (a.flags.includes('stale_event')) holds.push('older than the last PartnerStack event applied to this deal');\nelse if (a.flags.includes('transaction_already_applied')) holds.push('transaction already applied');\nelse if (ev.objectType === 'partnership') {\n  if (!pk.partnerCompany) holds.push('partner company not found in HubSpot (match by partner key or partner e-mail domain)');\n  else add('companies', pk.partnerCompany, { [`${P}partner_key`]: ev.partnerKey, [`${P}program_type`]: prog.programType, ...(prog.tier ? { [`${P}partner_tier`]: prog.tier } : {}),\n    ...(prog.groupName ? { [`${P}partner_group`]: prog.groupName } : {}), [`${P}partner_status`]: r.archived ? 'archived' : 'active', [`${P}commission_rate`]: prog.commissionRate, [`${P}last_sync_at`]: new Date().toISOString() }, 'partner_company');\n} else if (ev.objectType === 'deal') {\n  const stage = String(r.stage || '').toLowerCase();\n  stageStatus = WON.includes(stage) ? 'won' : LOST.includes(stage) ? 'lost' : 'registered';\n  if (['unmatched', 'ambiguous'].includes(a.dealMatch)) holds.push(a.dealMatch === 'ambiguous' ? 'several open deals on the customer company; nothing written' : 'no HubSpot deal or customer company matched');\n  else {\n    const amount = r.amount ?? nz(a.deal && a.deal.properties.amount);\n    if (selfRef) commission = { status: 'review', estimated: 0, reason: 'self-referral suspected' };\n    else if (stageStatus === 'won') commission = prog.rewardType === 'recurring_percent' ? { status: 'accruing', estimated: nz(a.deal && a.deal.properties[`${P}estimated_commission`]) } : { status: 'eligible', estimated: round2(amount * prog.commissionRate) };\n    else if (stageStatus === 'lost') commission = { status: 'not_eligible', estimated: 0 };\n    else commission = { status: 'pending', estimated: null };\n    if (a.deal) {\n      const props = { ...(selfRef ? {} : partnerFields(a.deal)), [`${P}deal_key`]: ev.objectKey, [`${P}registration_stage`]: r.stage, [`${P}attribution_status`]: selfRef ? 'review_self_referral' : stageStatus,\n        [`${P}reward_type`]: prog.rewardType, [`${P}commission_rate`]: prog.commissionRate, [`${P}commission_status`]: commission.status, [`${P}last_event_at`]: ev.occurredAt, [`${P}last_sync_at`]: new Date().toISOString() };\n      if (commission.estimated !== null) props[`${P}estimated_commission`] = commission.estimated;\n      if (stageStatus === 'registered' && !a.deal.properties[`${P}registered_at`]) props[`${P}registered_at`] = ev.createdAt || ev.occurredAt;\n      if (stageStatus === 'won' && !a.deal.properties[`${P}won_at`]) props[`${P}won_at`] = ev.occurredAt;\n      add('deals', a.deal, props, 'deal');\n    } else notes.push('registration has no matching HubSpot deal yet; company attribution only');\n    if (pk.customerCompany && !selfRef) add('companies', pk.customerCompany, { ...partnerFields(pk.customerCompany), [`${P}attribution_status`]: stageStatus === 'won' ? 'customer' : 'registered',\n      ...(!pk.customerCompany.properties[`${P}referred_at`] ? { [`${P}referred_at`]: ev.createdAt || ev.occurredAt } : {}) }, 'customer_company');\n    if (a.deal && pk.partnerCompany && !selfRef && !keepExisting) {\n      if (placeholder(ASSOC_ID)) notes.push('deal ↔ partner association skipped: HUBSPOT_PARTNER_ASSOCIATION_TYPE_ID not set');\n      else writes.push({ kind: 'associate', label: 'deal_partner_link', from: a.deal.id, to: pk.partnerCompany.id, typeId: Number(ASSOC_ID), category: ASSOC_CAT });\n    }\n  }\n} else if (ev.objectType === 'customer') {\n  if (!pk.customerCompany && !pk.contact) holds.push('no HubSpot contact or company for the referred customer');\n  if (selfRef) holds.push('self-referral suspected; attribution not written');\n  else {\n    add('contacts', pk.contact, { ...partnerFields(pk.contact), [`${P}customer_key`]: r.customerKey }, 'contact');\n    if (pk.customerCompany) add('companies', pk.customerCompany, { ...partnerFields(pk.customerCompany), [`${P}customer_key`]: r.customerKey, [`${P}attribution_status`]: 'referred',\n      ...(!pk.customerCompany.properties[`${P}referred_at`] ? { [`${P}referred_at`]: ev.createdAt || ev.occurredAt } : {}) }, 'customer_company');\n  }\n} else if (ev.objectType === 'transaction') {\n  if (!pk.customerCompany) holds.push('no HubSpot company carries this PartnerStack customer key');\n  else if (r.currency && r.currency !== CURRENCY) holds.push(`transaction currency ${r.currency} differs from COMMISSION_CURRENCY ${CURRENCY}`);\n  else {\n    const amt = r.amount || 0;\n    add('companies', pk.customerCompany, { [`${P}partner_sourced_revenue`]: round2(nz(pk.customerCompany.properties[`${P}partner_sourced_revenue`]) + amt), [`${P}last_transaction_key`]: r.transactionKey, [`${P}last_transaction_at`]: ev.occurredAt }, 'customer_company');\n    if (a.deal) {\n      const props = { [`${P}partner_sourced_revenue`]: round2(nz(a.deal.properties[`${P}partner_sourced_revenue`]) + amt), [`${P}last_transaction_key`]: r.transactionKey, [`${P}last_event_at`]: ev.occurredAt };\n      if (prog.rewardType === 'recurring_percent' && !selfRef) {\n        commission = { status: 'accruing', estimated: round2(nz(a.deal.properties[`${P}estimated_commission`]) + amt * prog.commissionRate), added: round2(amt * prog.commissionRate) };\n        props[`${P}estimated_commission`] = commission.estimated; props[`${P}commission_status`] = 'accruing';\n      }\n      add('deals', a.deal, props, 'deal');\n    } else notes.push('no won deal on the company; revenue recorded on the company only');\n  }\n}\nif (a.errors.length) { holds.push(`lookup errors: ${a.errors.join('; ')}`); writes.length = 0; }\n\nconst alerts = [];\nif (a.dealMatch === 'unmatched') alerts.push('unmatched_registration');\nif (a.dealMatch === 'ambiguous') alerts.push('ambiguous_deal');\nif (a.dealMatch === 'no_open_deal' && !selfRef) alerts.push('registration_without_deal');\nif (a.conflicts.length) alerts.push('attribution_conflict');\nif (selfRef) alerts.push('self_referral_suspected');\nif (ev.objectType === 'partnership' && !pk.partnerCompany) alerts.push('partner_company_not_found');\nif (holds.some((h) => h.startsWith('transaction currency'))) alerts.push('currency_mismatch');\nif (a.errors.length) alerts.push('lookup_failed');\nif (stageStatus === 'won' && a.deal && !selfRef && flag('NOTIFY_ON_PARTNER_WIN', true)) alerts.push('partner_sourced_win');\nreturn { json: { ...item, plan: { stageStatus, commission, writes, holds, notes, alerts } } };\n"
+      },
+      "id": "5ca32980-ea23-5fc7-8b36-051588a112cb",
+      "name": "Commission & Association Router",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        200
+      ],
+      "notes": "Deal / company / contact / partner updates · estimated commission · deal ↔ partner link."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "26c11748-552e-5a4a-966c-6549f31c030a",
+              "leftValue": "={{ $json.plan.writes.length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "7872a1a4-12ae-571a-9d75-3043f856c597",
+      "name": "Has Writes?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3600,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "844ca193-8e12-57bf-a2b5-cd13f876e0d6",
+              "leftValue": "={{ !$json.run.sandboxMode && !$json.run.dryRun }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "90ddbc28-32a4-5c6b-9976-07458b8ba686",
+      "name": "Live Writes?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3840,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate HubSpot Writes (Dry Run)     Mode: Run Once for Each Item\n// No network call. Shows every update and link that would be sent.\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json;\nreturn { json: { ...item, sync: { mode: item.run.mode, simulated: true, ok: true, writeCount: item.plan.writes.length, failed: [],\n  wouldWrite: item.plan.writes.map((w) => (w.kind === 'update' ? { label: w.label, object: w.object, id: w.id, properties: w.properties } : { label: w.label, from: w.from, to: w.to, typeId: w.typeId })) } } };\n"
+      },
+      "id": "2a4bac57-2571-55b6-bfa0-d974bbcde426",
+      "name": "Simulate HubSpot Writes (Dry Run)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4080,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Expand HubSpot Writes                 Mode: Run Once for All Items\n// One item per write. Updates go through batch/update and links through\n// the v4 batch association endpoint: both are POST and idempotent, so the\n// single write node can safely retry.\n// ─────────────────────────────────────────────────────────────────────\nconst out = [];\n$input.all().forEach((it, ref) => {\n  for (const w of it.json.plan.writes) {\n    if (w.kind === 'update') out.push({ json: { ref, label: w.label, object: w.object, recordId: w.id, path: `/crm/v3/objects/${w.object}/batch/update`, body: { inputs: [{ id: w.id, properties: w.properties }] } } });\n    else out.push({ json: { ref, label: w.label, object: 'association', recordId: w.from, path: '/crm/v4/associations/deals/companies/batch/create',\n      body: { inputs: [{ from: { id: w.from }, to: { id: w.to }, types: [{ associationCategory: w.category, associationTypeId: w.typeId }] }] } } });\n  }\n});\nreturn out;\n"
+      },
+      "id": "76bc57dd-246b-5c73-badd-e62ec9ce8068",
+      "name": "Expand HubSpot Writes",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4080,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}{{ $json.path }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}"
+      },
+      "id": "db4cb5be-abe9-5651-bfcb-8aec6f1f2fc9",
+      "name": "Apply HubSpot Write",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4320,
+        160
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "batch/update (deals, companies, contacts) or v4 batch association create · idempotent, so retries are safe."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Collect Write Results                 Mode: Run Once for All Items\n// Pairs each HubSpot response with its write, folds them back into one\n// item per event, and records fully applied events in the idempotency\n// ledger (so a PartnerStack retry isn't applied twice).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['PARTNERSTACK_WEBHOOK_SECRET', 'PARTNERSTACK_API_KEY', 'PARTNERSTACK_PUBLIC_KEY', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\nconst writes = $('Expand HubSpot Writes').all();\nconst events = $('Live Writes?').all();\nconst results = $input.all();\nconst byRef = {};\nresults.forEach((res, i) => {\n  const w = writes[i] ? writes[i].json : { ref: 0, label: 'unknown' };\n  const status = Number(res.json.statusCode || 0);\n  const body = res.json.body || {};\n  const errs = Array.isArray(body.errors) ? body.errors : [];\n  const ok = status >= 200 && status < 300 && errs.length === 0;\n  (byRef[w.ref] = byRef[w.ref] || []).push({ label: w.label, object: w.object, recordId: w.recordId, ok, httpStatus: status || null,\n    message: ok ? null : redactString((errs[0] && errs[0].message) || body.message || 'write failed').slice(0, 200) });\n});\nconst store = (() => { try { return $getWorkflowStaticData('global'); } catch (e) { return null; } })();\nreturn events.map((e, ref) => {\n  const list = byRef[ref] || [];\n  const ok = list.length > 0 && list.every((x) => x.ok);\n  if (ok && store) { store.psAttributionLedger = store.psAttributionLedger || {}; store.psAttributionLedger[e.json.dedupeKey] = { at: Date.now() }; }\n  return { json: { ...e.json, sync: { mode: 'live', simulated: false, ok, writeCount: list.length, results: list, failed: list.filter((x) => !x.ok).map((x) => x.label) } } };\n});\n"
+      },
+      "id": "22c83750-f3b6-5dd3-a837-02ae41074e3c",
+      "name": "Collect Write Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4560,
+        160
+      ],
+      "notes": "Folds responses back per event · ledger write when every write succeeded."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Partner Ops Alert               Mode: Run Once for Each Item\n// Slack Block Kit for partner-sourced wins and for anything a person must\n// resolve: unmatched or ambiguous registrations, attribution conflicts,\n// suspected self-referrals, currency mismatches, failed writes.\n// No customer contact details; partner and customer keys only.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst PORTAL = env('HUBSPOT_PORTAL_ID', 'YOUR_HUBSPOT_PORTAL_ID');\nconst APP = env('HUBSPOT_APP_BASE_URL', 'https://app.hubspot.com').replace(/\\/+$/, '');\nconst item = $json; const ev = item.event; const r = item.record; const a = item.attribution; const plan = item.plan; const sync = item.sync || null;\nconst esc = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst alerts = [...plan.alerts];\nif (sync && sync.ok === false) alerts.unshift('hubspot_write_failed');\nconst TITLE = { hubspot_write_failed: '⚠️ HubSpot attribution write failed', unmatched_registration: '🔎 Partner deal registration has no HubSpot match', ambiguous_deal: '🔀 Partner registration matches several open deals',\n  registration_without_deal: '📝 Partner registration: company found, no open deal', attribution_conflict: '⚖️ Partner attribution conflict', self_referral_suspected: '🚩 Possible partner self-referral',\n  partner_company_not_found: '🏢 New PartnerStack partner has no HubSpot company', currency_mismatch: '💱 Partner transaction in another currency', lookup_failed: '⚠️ HubSpot lookup failed', partner_sourced_win: '🏆 Partner-sourced deal won' };\nlet slackMessage = null;\nif (alerts.length) {\n  const real = (id) => id && !String(id).startsWith('sandbox');\n  const rec = (t, id) => `${APP}/contacts/${encodeURIComponent(PORTAL)}/record/${t}/${encodeURIComponent(id)}`;\n  const deal = a.deal; const prog = a.program;\n  const blocks = [{ type: 'header', text: { type: 'plain_text', text: (TITLE[alerts[0]] || alerts[0]).slice(0, 150), emoji: true } }];\n  blocks.push({ type: 'section', fields: [\n    { type: 'mrkdwn', text: `*Event*\\n\\`${esc(ev.name)}\\` · ${esc(ev.objectKey)}` },\n    { type: 'mrkdwn', text: `*Partner*\\n${esc(prog.partnerName || ev.partnerKey || 'n/a')}\\n${esc(prog.programType)}${prog.tier ? ` · ${esc(prog.tier)}` : ''}` },\n    { type: 'mrkdwn', text: `*Customer*\\n${esc(r.accountName || r.customerDomain || r.customerKey || 'n/a')}` },\n    { type: 'mrkdwn', text: `*HubSpot deal*\\n${deal ? esc(deal.properties.dealname || deal.id) : esc(a.dealMatch.replace(/_/g, ' '))}` },\n    { type: 'mrkdwn', text: `*Amount*\\n${r.amount != null ? `${esc(r.amount.toLocaleString('en-US'))} ${esc(r.currency || env('COMMISSION_CURRENCY', 'USD'))}` : 'n/a'}` },\n    { type: 'mrkdwn', text: `*Commission (est.)*\\n${plan.commission ? `${esc(plan.commission.status)}${plan.commission.estimated != null ? ` · ${esc(plan.commission.estimated)}` : ''} @ ${esc(Math.round(prog.commissionRate * 1000) / 10)}%` : 'n/a'}` },\n  ] });\n  const lines = alerts.slice(1).map((x) => `• ${esc(TITLE[x] || x)}`);\n  for (const c of a.conflicts) lines.push(`• ${esc(c.record)} already attributed to \\`${esc(c.existingPartnerKey)}\\` (${a.model === 'first_touch' ? 'kept' : 'overwritten'})`);\n  for (const c of a.candidates.slice(0, 4)) lines.push(`• Candidate deal: ${esc(c.name || c.id)} (score ${c.score})`);\n  for (const h of plan.holds) lines.push(`• ${esc(h)}`);\n  for (const n of plan.notes) lines.push(`• ${esc(n)}`);\n  if (sync && sync.failed && sync.failed.length) for (const f of sync.results.filter((x) => !x.ok)) lines.push(`• ${esc(f.label)}: HTTP ${esc(f.httpStatus)} ${esc(f.message)}`);\n  if (lines.length) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: lines.join('\\n').slice(0, 2900) } });\n  const buttons = [];\n  if (deal && real(deal.id)) buttons.push({ type: 'button', text: { type: 'plain_text', text: 'Open deal', emoji: true }, url: rec('0-3', deal.id) });\n  if (item.picked.customerCompany && real(item.picked.customerCompany.id)) buttons.push({ type: 'button', text: { type: 'plain_text', text: 'Open customer company', emoji: true }, url: rec('0-2', item.picked.customerCompany.id) });\n  if (item.picked.partnerCompany && real(item.picked.partnerCompany.id)) buttons.push({ type: 'button', text: { type: 'plain_text', text: 'Open partner', emoji: true }, url: rec('0-2', item.picked.partnerCompany.id) });\n  if (!buttons.length) buttons.push({ type: 'button', text: { type: 'plain_text', text: 'Open HubSpot deals', emoji: true }, url: `${APP}/contacts/${encodeURIComponent(PORTAL)}/objects/0-3/views/all/list` });\n  blocks.push({ type: 'actions', elements: buttons });\n  blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `Run \\`${esc(item.run.runId)}\\` · mode ${esc(item.run.mode)}${sync && sync.simulated ? ' _(simulated)_' : ''} · estimates only, PartnerStack is the system of record for payouts` }] });\n  slackMessage = { text: TITLE[alerts[0]] || alerts[0], blocks };\n}\nconst slackDelivery = !alerts.length ? 'none' : SANDBOX_MODE || DRY_RUN ? 'dry_run' : env('SLACK_WEBHOOK_URL', '') ? 'live' : 'not_configured';\nreturn { json: { ...item, sandboxFixtures: undefined, alertKinds: alerts, slackDelivery, slackMessage } };\n"
+      },
+      "id": "d53dcf06-cd10-54d9-acc2-689a595e4012",
+      "name": "Build Partner Ops Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4800,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "4df64e6c-0179-5523-a7cf-cf4f5bf0655a",
+              "leftValue": "={{ $json.slackDelivery }}",
+              "rightValue": "live",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "76a438d8-a7f1-53fd-ad22-ddcf1f75944b",
+      "name": "Post Slack Alert?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5040,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {
+          "timeout": 10000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackMessage) }}"
+      },
+      "id": "a46cdd34-9fca-571c-9dbc-09cab2011bd9",
+      "name": "Post Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5280,
+        200
+      ],
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Confirm Slack Delivery                Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst ctx = $('Post Slack Alert?').item.json;\nreturn { json: { ...ctx, slackMessage: undefined, slackResult: { simulated: false, mode: 'live', ok: true, at: new Date().toISOString() } } };\n"
+      },
+      "id": "ebef08f8-36ca-572e-aaad-8134c24779b1",
+      "name": "Confirm Slack Delivery",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5520,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitize Slack Error                  Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['PARTNERSTACK_WEBHOOK_SECRET', 'PARTNERSTACK_API_KEY', 'PARTNERSTACK_PUBLIC_KEY', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\nconst ctx = $('Post Slack Alert?').item.json;\nconst err = $json.error ?? $json;\nconst message = typeof err === 'string' ? err : (err && (err.message || err.description)) || 'slack_post_failed';\nconst httpCode = (err && (err.httpCode || err.statusCode || err.status)) || null;\nreturn { json: { ...ctx, slackMessage: undefined, slackResult: { simulated: false, mode: 'live', ok: false, httpCode: httpCode ? String(httpCode) : null, message: redactString(message).slice(0, 300) } } };\n"
+      },
+      "id": "d4cc8227-0ed3-55ee-acbf-f4334ea98bdf",
+      "name": "Sanitize Slack Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5520,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Slack Alert (Dry Run)        Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json;\nreturn { json: { ...item, slackResult: { simulated: true, mode: item.slackDelivery || 'none', blockCount: item.slackMessage ? item.slackMessage.blocks.length : 0,\n  note: item.slackDelivery === 'not_configured' ? 'SLACK_WEBHOOK_URL not set: alert not posted' : item.slackDelivery === 'dry_run' ? 'dry run: Block Kit built, not posted' : 'no alert needed' } } };\n"
+      },
+      "id": "e5ac4b78-6e3e-51f7-b836-3a7107865576",
+      "name": "Simulate Slack Alert (Dry Run)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5280,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Audit Logger                          Mode: Run Once for Each Item\n// One redacted record per PartnerStack event: keys, IDs, statuses, counts\n// and amounts only. No partner or customer names, e-mails or phone numbers.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['PARTNERSTACK_WEBHOOK_SECRET', 'PARTNERSTACK_API_KEY', 'PARTNERSTACK_PUBLIC_KEY', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst RING_SIZE = Math.max(0, num('AUDIT_RING_BUFFER_SIZE', 500));\nconst LOG_TO_STDOUT = flag('AUDIT_LOG_TO_STDOUT', true);\nconst item = $json; const ev = item.event || null; const a = item.attribution || null; const plan = item.plan || null; const pk = item.picked || null;\nconst record = redact({\n  auditVersion: 1,\n  at: new Date().toISOString(),\n  workflowId: $workflow.id || null,\n  executionId: $execution.id || null,\n  runId: item.run ? item.run.runId : null,\n  mode: item.run ? item.run.mode : null,\n  kind: item.kind || null,\n  reason: item.reason || null,\n  authMethod: item.authMethod || null,\n  event: ev ? { name: ev.name, objectKey: ev.objectKey, partnerKey: ev.partnerKey || null, occurredAt: ev.occurredAt || null } : null,\n  amount: item.record && item.record.amount != null ? { value: item.record.amount, currency: item.record.currency || null } : null,\n  records: pk ? { partnerCompanyId: pk.partnerCompany ? pk.partnerCompany.id : null, customerCompanyId: pk.customerCompany ? pk.customerCompany.id : null, contactId: pk.contact ? pk.contact.id : null, companySource: pk.companySource } : null,\n  attribution: a ? { model: a.model, programType: a.program.programType, tier: a.program.tier, rewardType: a.program.rewardType, rate: a.program.commissionRate, programSource: a.program.source,\n    dealId: a.deal ? a.deal.id : null, dealMatch: a.dealMatch, flags: a.flags, conflictCount: a.conflicts.length, errors: a.errors } : null,\n  plan: plan ? { stageStatus: plan.stageStatus, commissionStatus: plan.commission ? plan.commission.status : null, estimatedCommission: plan.commission ? plan.commission.estimated : null,\n    writeCount: plan.writes.length, holdCount: plan.holds.length, alerts: item.alertKinds || plan.alerts } : null,\n  sync: item.sync ? { simulated: item.sync.simulated, ok: item.sync.ok, writeCount: item.sync.writeCount, failed: item.sync.failed } : null,\n  slack: item.slackResult || null,\n});\nif (LOG_TO_STDOUT) { try { console.log(`[ps-attribution] ${JSON.stringify(record)}`); } catch (error) { /* best effort */ } }\nif (RING_SIZE > 0 && !SANDBOX_MODE) {\n  try {\n    const store = $getWorkflowStaticData('global');\n    if (!Array.isArray(store.psAttributionAudit)) store.psAttributionAudit = [];\n    store.psAttributionAudit.push(record);\n    if (store.psAttributionAudit.length > RING_SIZE) store.psAttributionAudit.splice(0, store.psAttributionAudit.length - RING_SIZE);\n  } catch (error) { /* static data unavailable in some manual runs */ }\n}\nreturn { json: record };\n"
+      },
+      "id": "f3c79917-cdf9-5270-8515-8139676948f9",
+      "name": "Audit Logger",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5760,
+        300
+      ],
+      "notes": "Keys, IDs, statuses, amounts only · stdout + ring buffer."
+    },
+    {
+      "parameters": {},
+      "id": "376f2689-d268-5ca0-99c3-954ca65836ce",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        900
+      ],
+      "notes": "Fires when this workflow is selected as its own Error Workflow."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitized Error Handler              Mode: Run Once for All Items\n// Fed by the Error Trigger when this workflow is its own Error Workflow.\n// Drops stack traces and request options, redacts secrets, and emits a\n// safe alert record (and optionally a minimal Slack notice).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['PARTNERSTACK_WEBHOOK_SECRET', 'PARTNERSTACK_API_KEY', 'PARTNERSTACK_PUBLIC_KEY', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\n\nreturn $input.all().map(({ json }) => {\n  const execution = json.execution || {};\n  const error = execution.error || (json.trigger && json.trigger.error) || {};\n  const alert = {\n    alertType: 'partnerstack_attribution_execution_error',\n    at: new Date().toISOString(),\n    workflow: { id: json.workflow ? json.workflow.id : null, name: redactString(json.workflow ? json.workflow.name : '') },\n    execution: { id: execution.id || null, mode: execution.mode || null, retryOf: execution.retryOf || null },\n    lastNodeExecuted: execution.lastNodeExecuted || null,\n    errorName: redactString(error.name || 'Error'),\n    errorMessage: redactString(error.message || 'unknown error').slice(0, 300),\n    nextStep: 'Open the execution in n8n (restricted access) and check the node named in lastNodeExecuted.',\n  };\n  try { console.error(`[ps-attribution:error] ${JSON.stringify(alert)}`); } catch (e) { /* best effort */ }\n  const notify = !SANDBOX_MODE && !DRY_RUN && env('SLACK_WEBHOOK_URL', '') !== '' && flag('SLACK_NOTIFY_ON_MONITOR_ERROR', true);\n  return {\n    json: {\n      ...alert,\n      notify,\n      slackMessage: {\n        text: `PartnerStack attribution sync failed at ${alert.lastNodeExecuted || 'unknown node'}`,\n        blocks: [\n          { type: 'header', text: { type: 'plain_text', text: '⚠️ PartnerStack attribution sync failed', emoji: true } },\n          { type: 'section', text: { type: 'mrkdwn', text: `*Node:* ${alert.lastNodeExecuted || 'unknown'}\\n*Error:* ${alert.errorName}: ${alert.errorMessage}` } },\n          { type: 'context', elements: [{ type: 'mrkdwn', text: `Execution \\`${alert.execution.id || 'n/a'}\\` · PartnerStack events received while this was failing were not synced; replay them from PartnerStack or re-send` }] },\n        ],\n      },\n    },\n  };\n});\n"
+      },
+      "id": "d361df89-1528-5efa-9b03-f377df8439a9",
+      "name": "Sanitized Error Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "a74df800-f796-5eb8-b7b6-e445169551b8",
+              "leftValue": "={{ $json.notify }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "bb213993-a113-5c5b-8597-61d2d24668e8",
+      "name": "Notify Execution Error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {
+          "timeout": 10000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackMessage) }}"
+      },
+      "id": "85b6d579-c6e1-5b2c-9bbe-c9225a737460",
+      "name": "Post Execution Error Notice",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        840
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## n8n-hubspot-partnerstack-deal-attribution-sync\nPartnerStack referral, affiliate and reseller attribution → HubSpot deals, companies and contacts. dhRobin Systems.\n\n**Safe defaults:** `SANDBOX_MODE=true`, `DRY_RUN=true`. No HubSpot, PartnerStack or Slack calls until both are `false`.\n\n**Stage 1** Execute *PartnerStack Webhook Trigger* (12 fictional events).\n**Stage 2** `SANDBOX_MODE=false`: real lookups, writes simulated.\n**Stage 3** `DRY_RUN=false`: attribution writes and Slack alerts go live.\n\nPartnerStack doesn't document webhook signing. See README.md §5.",
+        "height": 320,
+        "width": 720,
+        "color": 4
+      },
+      "id": "740bedea-61a1-5d96-a4e5-44a6c78308db",
+      "name": "Sticky: Start Here",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Attribution matching\nPartner company by ps_partner_key · customer company by domain or ps_customer_key · deal by ps_deal_key, else the company's open (registration) or won (transaction) deal. Ties write nothing.",
+        "height": 120,
+        "width": 640,
+        "color": 3
+      },
+      "id": "075263be-057b-5e11-91fb-7cd91aa4fbae",
+      "name": "Sticky: Matching",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1160,
+        540
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Sanitized error path\nNo stack traces, headers or request bodies. Secrets, API keys and Slack URLs are redacted.",
+        "height": 90,
+        "width": 600,
+        "color": 2
+      },
+      "id": "bf84e856-c2ad-5e82-afc6-84758a9b2561",
+      "name": "Sticky: Errors",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        780
+      ]
+    }
+  ],
+  "connections": {
+    "PartnerStack Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Verify Signature & Normalize Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Signature & Normalize Event": {
+      "main": [
+        [
+          {
+            "node": "Process Event?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Event?": {
+      "main": [
+        [
+          {
+            "node": "Build Lookup Plan",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Lookup Plan": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Lookups?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Lookups?": {
+      "main": [
+        [
+          {
+            "node": "Simulate HubSpot Lookups (Sandbox)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Search Partner Company",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate HubSpot Lookups (Sandbox)": {
+      "main": [
+        [
+          {
+            "node": "Pick Records & Build Deal Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Partner Company": {
+      "main": [
+        [
+          {
+            "node": "Search Customer Company",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Customer Company": {
+      "main": [
+        [
+          {
+            "node": "Search Customer Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Customer Contact": {
+      "main": [
+        [
+          {
+            "node": "Pick Records & Build Deal Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick Records & Build Deal Search": {
+      "main": [
+        [
+          {
+            "node": "Live Deal Search?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Live Deal Search?": {
+      "main": [
+        [
+          {
+            "node": "Search Candidate Deals",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Resolve Attribution",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Candidate Deals": {
+      "main": [
+        [
+          {
+            "node": "Enrich Partner?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enrich Partner?": {
+      "main": [
+        [
+          {
+            "node": "Fetch PartnerStack Partnership",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Resolve Attribution",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch PartnerStack Partnership": {
+      "main": [
+        [
+          {
+            "node": "Resolve Attribution",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Attribution": {
+      "main": [
+        [
+          {
+            "node": "Commission & Association Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Commission & Association Router": {
+      "main": [
+        [
+          {
+            "node": "Has Writes?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Writes?": {
+      "main": [
+        [
+          {
+            "node": "Live Writes?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Partner Ops Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Live Writes?": {
+      "main": [
+        [
+          {
+            "node": "Expand HubSpot Writes",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Simulate HubSpot Writes (Dry Run)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate HubSpot Writes (Dry Run)": {
+      "main": [
+        [
+          {
+            "node": "Build Partner Ops Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Expand HubSpot Writes": {
+      "main": [
+        [
+          {
+            "node": "Apply HubSpot Write",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply HubSpot Write": {
+      "main": [
+        [
+          {
+            "node": "Collect Write Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Write Results": {
+      "main": [
+        [
+          {
+            "node": "Build Partner Ops Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Partner Ops Alert": {
+      "main": [
+        [
+          {
+            "node": "Post Slack Alert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Slack Alert?": {
+      "main": [
+        [
+          {
+            "node": "Post Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Simulate Slack Alert (Dry Run)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Slack Alert": {
+      "main": [
+        [
+          {
+            "node": "Confirm Slack Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sanitize Slack Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confirm Slack Delivery": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Slack Error": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Slack Alert (Dry Run)": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Sanitized Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitized Error Handler": {
+      "main": [
+        [
+          {
+            "node": "Notify Execution Error?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Execution Error?": {
+      "main": [
+        [
+          {
+            "node": "Post Execution Error Notice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "pinData": {
+    "PartnerStack Webhook Trigger": [
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "PartnerStack-Webhooks (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {
+            "key": "sandbox-fictional-partnerstack-secret-not-for-production"
+          },
+          "body": {
+            "id": 7101,
+            "partner_key": "cedar-fixture",
+            "first_name": "Avery",
+            "last_name": "Fixture",
+            "email": "avery@cedar-fixture.example",
+            "group": {
+              "id": 12,
+              "name": "Silver Referral Partners",
+              "slug": "silver-referral-partners"
+            },
+            "event": "partnership_created",
+            "archived": false
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/partnerstack-attribution",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT partnership_created (underscore form) · URL token · partner company found by e-mail domain → ps_partner_key, referral silver, active",
+          "sandboxFixtures": {
+            "partnerAssociationTypeId": "9001",
+            "partnerGroupMap": {
+              "gold-resellers": {
+                "programType": "reseller",
+                "tier": "gold"
+              },
+              "silver-referral-partners": {
+                "programType": "referral",
+                "tier": "silver"
+              },
+              "creator-affiliates": {
+                "programType": "affiliate",
+                "tier": "bronze"
+              }
+            },
+            "companies": [
+              {
+                "id": "sandbox-co-p1",
+                "properties": {
+                  "name": "Bluebird Fixture Consulting",
+                  "domain": "bluebird-fixture.example",
+                  "ps_partner_key": "bluebird-fixture",
+                  "ps_program_type": "reseller",
+                  "ps_partner_tier": "gold"
+                }
+              },
+              {
+                "id": "sandbox-co-p2",
+                "properties": {
+                  "name": "Maple Fixture Advisors",
+                  "domain": "maple-fixture.example",
+                  "ps_partner_key": "maple-fixture",
+                  "ps_program_type": "referral",
+                  "ps_partner_tier": "silver"
+                }
+              },
+              {
+                "id": "sandbox-co-p3",
+                "properties": {
+                  "name": "Pinecone Fixture Media",
+                  "domain": "pinecone-fixture.example",
+                  "ps_partner_key": "pinecone-fixture",
+                  "ps_program_type": "affiliate",
+                  "ps_partner_tier": "bronze",
+                  "ps_commission_rate": "25"
+                }
+              },
+              {
+                "id": "sandbox-co-p4",
+                "properties": {
+                  "name": "Cedar Fixture Partners",
+                  "domain": "cedar-fixture.example"
+                }
+              },
+              {
+                "id": "sandbox-co-c1",
+                "properties": {
+                  "name": "Harbor Fixture Logistics",
+                  "domain": "harbor-fixture.example"
+                }
+              },
+              {
+                "id": "sandbox-co-c2",
+                "properties": {
+                  "name": "Quarry Fixture Foods",
+                  "domain": "quarry-fixture.example",
+                  "ps_partner_key": "maple-fixture",
+                  "ps_attribution_status": "registered",
+                  "ps_referred_at": "2026-10-02T09:00:00.000Z"
+                }
+              },
+              {
+                "id": "sandbox-co-c3",
+                "properties": {
+                  "name": "Lumen Fixture Studio",
+                  "domain": "lumen-fixture.example",
+                  "ps_partner_key": "pinecone-fixture",
+                  "ps_customer_key": "cus_fx_lumen",
+                  "ps_attribution_status": "customer",
+                  "ps_partner_sourced_revenue": "600",
+                  "ps_last_transaction_key": "txn_fx_0099"
+                }
+              },
+              {
+                "id": "sandbox-co-c4",
+                "properties": {
+                  "name": "Orchid Fixture Labs",
+                  "domain": "orchid-fixture.example",
+                  "ps_partner_key": "maple-fixture",
+                  "ps_attribution_status": "referred"
+                }
+              },
+              {
+                "id": "sandbox-co-c5",
+                "properties": {
+                  "name": "Willow Fixture Retail",
+                  "domain": "willow-fixture.example"
+                }
+              }
+            ],
+            "contacts": [
+              {
+                "id": "sandbox-contact-31",
+                "properties": {
+                  "email": "jordan@lumen-fixture.example",
+                  "associatedcompanyid": "sandbox-co-c3",
+                  "ps_partner_key": "pinecone-fixture",
+                  "ps_customer_key": "cus_fx_lumen"
+                }
+              },
+              {
+                "id": "sandbox-contact-41",
+                "properties": {
+                  "email": "sam@orchid-fixture.example",
+                  "associatedcompanyid": "sandbox-co-c4",
+                  "ps_partner_key": "maple-fixture"
+                }
+              },
+              {
+                "id": "sandbox-contact-11",
+                "properties": {
+                  "email": "riley@harbor-fixture.example",
+                  "associatedcompanyid": "sandbox-co-c1"
+                }
+              }
+            ],
+            "deals": [
+              {
+                "id": "sandbox-deal-101",
+                "companyId": "sandbox-co-c1",
+                "properties": {
+                  "dealname": "Harbor Fixture · fleet platform",
+                  "amount": "36000",
+                  "dealstage": "appointmentscheduled",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false"
+                }
+              },
+              {
+                "id": "sandbox-deal-102",
+                "companyId": "sandbox-co-c2",
+                "properties": {
+                  "dealname": "Quarry Fixture · cold-chain suite",
+                  "amount": "52000",
+                  "dealstage": "appointmentscheduled",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false",
+                  "ps_deal_key": "deal_fx1002",
+                  "ps_partner_key": "maple-fixture",
+                  "ps_attribution_status": "registered",
+                  "ps_commission_status": "pending",
+                  "ps_last_event_at": "2026-11-10T12:00:00.000Z"
+                }
+              },
+              {
+                "id": "sandbox-deal-103",
+                "companyId": "sandbox-co-c3",
+                "properties": {
+                  "dealname": "Lumen Fixture · annual plan",
+                  "amount": "4800",
+                  "dealstage": "closedwon",
+                  "hs_is_closed": "true",
+                  "hs_is_closed_won": "true",
+                  "ps_partner_key": "pinecone-fixture",
+                  "ps_commission_status": "accruing",
+                  "ps_estimated_commission": "150",
+                  "ps_partner_sourced_revenue": "600",
+                  "ps_last_transaction_key": "txn_fx_0099",
+                  "ps_won_at": "2026-09-01T10:00:00.000Z"
+                }
+              },
+              {
+                "id": "sandbox-deal-104",
+                "companyId": "sandbox-co-c5",
+                "properties": {
+                  "dealname": "Willow Fixture · POS rollout",
+                  "amount": "20000",
+                  "dealstage": "appointmentscheduled",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false"
+                }
+              },
+              {
+                "id": "sandbox-deal-105",
+                "companyId": "sandbox-co-c5",
+                "properties": {
+                  "dealname": "Willow Fixture · loyalty add-on",
+                  "amount": "20000",
+                  "dealstage": "appointmentscheduled",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false"
+                }
+              }
+            ],
+            "partnerships": {
+              "bluebird-fixture": {
+                "key": "part_fx_bluebird",
+                "partner_key": "bluebird-fixture",
+                "group": {
+                  "name": "Gold Resellers",
+                  "slug": "gold-resellers"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "PartnerStack-Webhooks (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {
+            "key": "sandbox-fictional-partnerstack-secret-not-for-production",
+            "event": "deal.created"
+          },
+          "body": {
+            "account_name": "Harbor Fixture Logistics",
+            "amount": 36000,
+            "close_date": 1797292800000,
+            "company_id": 6,
+            "contact_first_name": "Riley",
+            "contact_last_name": "Fixture",
+            "created_at": 1794816000000,
+            "key": "deal_fx1001",
+            "meta": {
+              "company_domain_x7k2p9": "harbor-fixture.example",
+              "contact_email_q4m1z8": "riley@harbor-fixture.example"
+            },
+            "partner_key": "bluebird-fixture",
+            "stage": "Registered",
+            "updated_at": 1794816000000
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/partnerstack-attribution",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT deal registration (no event field, ?event=deal.created) · gold reseller via PartnerStack API group · single open deal → attributed, pending · partner link"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-attribution-signature": "sha256=05130692acaf8421643e8c975f923e71f5be49a5ff101d48f76dfced811e647d",
+            "x-attribution-timestamp": "1795000000",
+            "user-agent": "attribution-relay (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "deal.updated",
+            "account_name": "Quarry Fixture Foods",
+            "amount": 52000,
+            "close_date": 1794614400000,
+            "created_at": 1790931600000,
+            "key": "deal_fx1002",
+            "meta": {
+              "company_domain_a1b2c3": "quarry-fixture.example"
+            },
+            "partner_key": "maple-fixture",
+            "stage": "Closed Won",
+            "updated_at": 1794821400000
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/partnerstack-attribution",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT HMAC relay · deal key match · Closed Won → eligible, 52,000 × 15% = 7,800 · partner win alert"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-attribution-signature": "sha256=0d4b705113514e6631d746947ee87e7e6fe38878b82232c15845ff17ffcd04ff",
+            "x-attribution-timestamp": "1795000000",
+            "user-agent": "attribution-relay (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "deal.updated",
+            "account_name": "Quarry Fixture Foods",
+            "amount": 50000,
+            "key": "deal_fx1002",
+            "partner_key": "maple-fixture",
+            "stage": "Working",
+            "updated_at": 1793869200000
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/partnerstack-attribution",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT stale_event (older than ps_last_event_at) · nothing written"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "PartnerStack-Webhooks (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {
+            "key": "sandbox-fictional-partnerstack-secret-not-for-production"
+          },
+          "body": {
+            "id": 8801,
+            "key": "cus_fx_lumen",
+            "email": "jordan@lumen-fixture.example",
+            "name": "Jordan Fixture",
+            "partner_key": "pinecone-fixture",
+            "created_at": 1787220000000,
+            "updated_at": 1794812400000,
+            "archived": false,
+            "event": "customer.updated"
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/partnerstack-attribution",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT customer.updated · same partner already attributed → contact + company refreshed, no conflict"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "PartnerStack-Webhooks (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {
+            "key": "sandbox-fictional-partnerstack-secret-not-for-production"
+          },
+          "body": {
+            "id": 8802,
+            "key": "cus_fx_orchid",
+            "email": "sam@orchid-fixture.example",
+            "name": "Sam Fixture",
+            "partner_key": "pinecone-fixture",
+            "created_at": 1794808800000,
+            "updated_at": 1794808800000,
+            "archived": false,
+            "event": "customer.created"
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/partnerstack-attribution",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT attribution conflict (company + contact already maple-fixture) · first-touch keeps existing partner · alert"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "PartnerStack-Webhooks (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {
+            "key": "sandbox-fictional-partnerstack-secret-not-for-production"
+          },
+          "body": {
+            "id": 9901,
+            "customer_key": "cus_fx_lumen",
+            "partner_key": "pinecone-fixture",
+            "currency": "USD",
+            "amount": 120000,
+            "key": "txn_fx_0100",
+            "event": "transaction.created",
+            "archived": false,
+            "created_at": 1794805200000,
+            "updated_at": 1794805200000
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/partnerstack-attribution",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT transaction $1,200 (cents) · company by ps_customer_key · won deal · affiliate 25% → +300 accrued (150 → 450), revenue 600 → 1,800"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "PartnerStack-Webhooks (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {
+            "key": "sandbox-fictional-partnerstack-secret-not-for-production"
+          },
+          "body": {
+            "id": 9902,
+            "customer_key": "cus_fx_lumen",
+            "partner_key": "pinecone-fixture",
+            "currency": "USD",
+            "amount": 60000,
+            "key": "txn_fx_0099",
+            "event": "transaction.created",
+            "archived": false,
+            "created_at": 1792126800000,
+            "updated_at": 1792126800000
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/partnerstack-attribution",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT transaction_already_applied (key matches ps_last_transaction_key) · nothing written"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-attribution-signature": "sha256=b2a79258b456f1b0f5180099b613f1fd1ca725bd57514ef69df086d3a27e5848",
+            "x-attribution-timestamp": "1795000000",
+            "user-agent": "attribution-relay (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "deal.created",
+            "account_name": "Willow Fixture Retail",
+            "amount": 15000,
+            "key": "deal_fx1005",
+            "meta": {
+              "company_domain_z9": "willow-fixture.example"
+            },
+            "partner_key": "maple-fixture",
+            "stage": "Registered",
+            "created_at": 1794801600000,
+            "updated_at": 1794801600000
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/partnerstack-attribution",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT ambiguous (2 open deals, equal score) · nothing written · alert"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-attribution-signature": "sha256=a8b24ce18c5569ad80282d50bc69f3c0843c13d78adc4d7a3daa483592d76b80",
+            "x-attribution-timestamp": "1795000000",
+            "user-agent": "attribution-relay (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "deal.created",
+            "account_name": "Bluebird Fixture Consulting",
+            "amount": 9000,
+            "key": "deal_fx1006",
+            "meta": {
+              "company_domain_k1": "bluebird-fixture.example"
+            },
+            "partner_key": "bluebird-fixture",
+            "stage": "Registered",
+            "created_at": 1794798000000,
+            "updated_at": 1794798000000
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/partnerstack-attribution",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT self_referral_suspected (customer domain = partner domain) · no attribution · alert"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "PartnerStack-Webhooks (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {
+            "key": "wrong-fictional-key"
+          },
+          "body": {
+            "event": "deal.created",
+            "account_name": "Nimbus Fixture Air",
+            "amount": 18000,
+            "key": "deal_fx1007",
+            "meta": {
+              "company_domain_r2": "nimbus-fixture.example"
+            },
+            "partner_key": "maple-fixture",
+            "stage": "Registered",
+            "created_at": 1794794400000,
+            "updated_at": 1794794400000
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/partnerstack-attribution",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT rejected · url_token_mismatch"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "PartnerStack-Webhooks (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {
+            "key": "sandbox-fictional-partnerstack-secret-not-for-production"
+          },
+          "body": {
+            "approved": false,
+            "archived": false,
+            "company_id": 6,
+            "email": "lead@nimbus-fixture.example",
+            "key": "lead_fx_1",
+            "partner_key": "maple-fixture",
+            "status": "open",
+            "event": "lead_created",
+            "updated_at": 1794790800000
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/partnerstack-attribution",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT ignored · event_type_not_processed (lead.created)"
+        }
+      }
+    ]
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": false,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "UTC"
+  },
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "author": "DH Robin (dhRobin Systems)",
+    "license": "MIT"
+  }
+}
