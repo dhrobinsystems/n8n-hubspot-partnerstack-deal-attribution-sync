@@ -45,6 +45,8 @@ I designed this workflow so that every PartnerStack event either lands on a spec
 
 ## 2. Architecture
 
+![n8n HubSpot PartnerStack Deal Attribution Sync Workflow Overview](./workflow-overview.png)
+
 ```mermaid
 flowchart TD
     A[PartnerStack Webhook Trigger<br/>partnership · deal · customer · transaction] --> B[Verify Signature & Normalize Event<br/>HMAC relay or URL token · event names · keys · amounts]
